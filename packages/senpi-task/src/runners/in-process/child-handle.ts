@@ -92,6 +92,7 @@ export type ChildHandle = {
   abort(): Promise<void>
   subscribe(listener: ChildSessionListener): () => void
   waitForIdle(): Promise<RunnerOutcome>
+  onSelfResumed?(listener: () => void): () => void
   lastAssistantText(): string | undefined
   dispose(): Promise<void> | void
 }
@@ -240,16 +241,14 @@ function createTrackedChildHandle(
   let aborted = false
   let disposed = false
   let turnActive = false
+  let resolveSelfResumed: ((outcome: RunnerOutcome) => void) | undefined
+  const resumedListeners = new Set<() => void>()
   // Seeded for the restored case; createChildHandle's beginTurn replaces it immediately.
   let running: Promise<RunnerOutcome> = Promise.resolve(settledSessionOutcome(session, completion))
   const observation: TurnObservation = {
     text: undefined, stopReason: undefined, errorMessage: undefined, baseline: undefined, provider: undefined, model: undefined,
   }
-  const unsubscribeObserver = session.subscribe((event) => observeTurnEvent(observation, event))
-
-  // Start a fresh tracked turn and mark it active until it settles. waitForIdle() always returns the
-  // CURRENT turn, so a revive follow-up re-arms it to the new turn instead of a stale resolved one.
-  const beginTurn = (text: string): void => {
+  const resetTurn = (): void => {
     aborted = false
     turnActive = true
     observation.text = undefined
@@ -258,13 +257,41 @@ function createTrackedChildHandle(
     observation.provider = undefined
     observation.model = undefined
     observation.baseline = session.getLastAssistantText()
-    running = runTurn(session, text, () => aborted, observation, completion)
-    void running.then(
+  }
+  const settleSelfResumed = (outcome: RunnerOutcome): void => {
+    const resolve = resolveSelfResumed
+    if (resolve === undefined) return
+    resolveSelfResumed = undefined
+    turnActive = false
+    resolve(outcome)
+  }
+  const unsubscribeObserver = session.subscribe((event) => {
+    if (disposed) return
+    if (event.type === "agent_start" && !turnActive && !aborted) {
+      resetTurn()
+      running = new Promise((resolve) => { resolveSelfResumed = resolve })
+      for (const listener of resumedListeners) listener()
+    }
+    observeTurnEvent(observation, event)
+    // An autonomous run has no prompt() promise owned by this handle. agent_end can still be
+    // followed by a deferred continuation; only agent_idle settles the session's new outcome.
+    if (event.type === "agent_idle" && resolveSelfResumed !== undefined) {
+      settleSelfResumed(aborted ? { status: "cancelled" } : turnOutcome(session, observation, completion))
+    }
+  })
+
+  // Explicit prompts mark the turn active before prompt() can emit agent_start, so they never
+  // masquerade as autonomous resumes. Their existing prompt-resolution contract stays intact.
+  const beginTurn = (text: string): void => {
+    resetTurn()
+    const current = runTurn(session, text, () => aborted, observation, completion)
+    running = current
+    void current.then(
       () => {
-        turnActive = false
+        if (running === current) turnActive = false
       },
       () => {
-        turnActive = false
+        if (running === current) turnActive = false
       },
     )
   }
@@ -285,13 +312,20 @@ function createTrackedChildHandle(
     abort: async () => {
       aborted = true
       await session.abort()
+      settleSelfResumed({ status: "cancelled" })
     },
     subscribe: (listener) => session.subscribe(listener),
     waitForIdle: () => running,
+    onSelfResumed: (listener) => {
+      resumedListeners.add(listener)
+      return () => resumedListeners.delete(listener)
+    },
     lastAssistantText: () => session.getLastAssistantText(),
     dispose: async () => {
       if (disposed) return
       disposed = true
+      settleSelfResumed({ status: "cancelled" })
+      resumedListeners.clear()
       unsubscribeObserver()
       await shutDownChildSession(session)
     },

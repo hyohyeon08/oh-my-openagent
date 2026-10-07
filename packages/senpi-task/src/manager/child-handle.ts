@@ -59,7 +59,7 @@ export type ManagedChildHandle = {
   subscribe(listener: ManagedChildListener): () => void
   subscribeExtensionEvents?(listener: ChildExtensionListener): () => void
   waitForOutcome(): Promise<RunnerOutcome>
-  // Present on process children: fires when the child starts a run on its own after its turn
+  // Fires when the child starts a run on its own after its turn
   // settled (a monitor or background job woke it), so the manager can reopen the record.
   onSelfResumed?(listener: () => void): () => void
   // RPC handles expose a settled process signal; in-process handles omit it because their session
@@ -84,6 +84,7 @@ export function adaptInProcessHandle(handle: InProcessChildHandle): ManagedChild
     abort: () => handle.abort(),
     subscribe: (listener) => handle.subscribe(listener),
     waitForOutcome: () => handle.waitForIdle(),
+    ...(handle.onSelfResumed === undefined ? {} : { onSelfResumed: (listener: () => void) => handle.onSelfResumed?.(listener) ?? (() => undefined) }),
     lastAssistantText: () => handle.lastAssistantText(),
     dispose: async () => {
       await handle.dispose()

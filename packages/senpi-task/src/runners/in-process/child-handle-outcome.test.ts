@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { createChildHandle, type ChildSession, type ChildSessionEvent, type ChildSessionListener } from "./child-handle"
+import { createChildHandle, createRestoredChildHandle, type ChildCompletionPolicy, type ChildSession, type ChildSessionEvent, type ChildSessionListener, type RunnerOutcome } from "./child-handle"
 
 type EmittingSessionControls = {
   readonly session: ChildSession
@@ -14,12 +14,16 @@ type EmittingSessionControls = {
 function createEmittingSession(sessionId = "child-session-1"): EmittingSessionControls {
   const listeners = new Set<ChildSessionListener>()
   const lastText = { value: undefined as string | undefined }
+  const emit = (event: ChildSessionEvent): void => {
+    for (const listener of listeners) listener(event)
+  }
   let settle: (() => void) | undefined
   const session: ChildSession = {
     sessionId,
     prompt() {
       return new Promise<void>((resolve) => {
         settle = resolve
+        emit({ type: "agent_start" })
       })
     },
     async steer() { return "handled" },
@@ -37,9 +41,7 @@ function createEmittingSession(sessionId = "child-session-1"): EmittingSessionCo
   return {
     session,
     lastText,
-    emit: (event) => {
-      for (const listener of listeners) listener(event)
-    },
+    emit,
     resolvePrompt: () => settle?.(),
   }
 }
@@ -186,7 +188,7 @@ describe("createChildHandle turn outcomes", () => {
     expect(outcome.failure.message).toContain("no assistant output")
   })
 
-  test("#given a revived child whose new turn produces nothing #when the revive turn resolves #then the stale previous response is NOT reused as a fresh completion", async () => {
+  test.each(["follow-up", "self-resume"])("#given a child revived by %s whose new turn produces nothing #when the turn settles #then the stale previous response is NOT reused", async (source) => {
     // given a first turn that completed with real output
     const fake = createEmittingSession()
     const handle = createChildHandle({ taskId: "task-1", session: fake.session, promptText: "first run" })
@@ -196,12 +198,97 @@ describe("createChildHandle turn outcomes", () => {
     expect(await handle.waitForIdle()).toEqual({ status: "completed", finalResponse: "first verdict" })
 
     // when a revive turn produces no new output
-    await handle.followUp("re-emit your verdict")
-    fake.resolvePrompt()
+    if (source === "follow-up") {
+      await handle.followUp("re-emit your verdict")
+      fake.resolvePrompt()
+    } else {
+      fake.emit({ type: "agent_start" })
+      fake.emit({ type: "agent_idle" })
+    }
     const outcome = await handle.waitForIdle()
 
     // then the previous run's text must not masquerade as the revive result
     expect(outcome.status).toBe("error")
+  })
+
+  test.each<{
+    completion: ChildCompletionPolicy
+    stopReason: string
+    expected: RunnerOutcome
+  }>([
+    { completion: "turn", stopReason: "stop", expected: { status: "completed", finalResponse: "" } },
+    { completion: "turn", stopReason: "error", expected: { status: "error", failure: { kind: "child-turn-failed", message: "provider failed" } } },
+    { completion: "final-text", stopReason: "aborted", expected: { status: "error", failure: { kind: "child-turn-failed", message: "provider failed" } } },
+  ])("#given autonomous work with completion $completion #when it ends with $stopReason #then only the new turn's outcome and provenance are reported", async ({ completion, stopReason, expected }) => {
+    const fake = createEmittingSession()
+    const handle = createChildHandle({ taskId: "task-1", session: fake.session, promptText: "first", completion })
+    fake.emit(assistantEnd("first verdict", "stop", undefined, "initial-provider", "initial-model"))
+    fake.lastText.value = "first verdict"
+    fake.resolvePrompt()
+    await handle.waitForIdle()
+
+    fake.emit({ type: "agent_start" })
+    const outcome = handle.waitForIdle()
+    fake.emit(assistantEnd("", stopReason, stopReason === "stop" ? undefined : "provider failed"))
+    fake.emit({ type: "agent_idle" })
+    expect(await outcome).toEqual(expected)
+    await handle.dispose()
+  })
+
+  test("#given a restored child #when it resumes autonomously and continues after agent_end #then it settles only at agent_idle and explicit prompts do not announce self-resume", async () => {
+    const fake = createEmittingSession()
+    fake.lastText.value = "restored verdict"
+    const handle = createRestoredChildHandle({ taskId: "task-1", session: fake.session })
+    let resumed = 0
+    const unsubscribe = handle.onSelfResumed?.(() => { resumed += 1 })
+
+    fake.emit({ type: "agent_start" })
+    const outcome = handle.waitForIdle()
+    let settled = false
+    void outcome.then(() => { settled = true })
+    fake.emit(assistantEnd("intermediate result", "stop"))
+    fake.emit({ type: "agent_end" })
+    fake.emit({ type: "agent_settled" })
+    // Drain the already-registered outcome reaction; neither event is an idle boundary.
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    fake.emit({ type: "agent_start" })
+    fake.emit(assistantEnd("continued result", "stop"))
+    fake.emit({ type: "agent_idle" })
+    expect(await outcome).toEqual({ status: "completed", finalResponse: "continued result" })
+    expect(resumed).toBe(1)
+
+    await handle.followUp("explicit request")
+    fake.emit(assistantEnd("explicit result", "stop"))
+    fake.resolvePrompt()
+    expect(await handle.waitForIdle()).toEqual({ status: "completed", finalResponse: "explicit result" })
+    expect(resumed).toBe(1)
+
+    unsubscribe?.()
+    fake.emit({ type: "agent_start" })
+    fake.emit(assistantEnd("unsubscribed result", "stop"))
+    fake.emit({ type: "agent_idle" })
+    expect(await handle.waitForIdle()).toEqual({ status: "completed", finalResponse: "unsubscribed result" })
+    expect(resumed).toBe(1)
+    await handle.dispose()
+  })
+
+  test.each(["abort", "dispose"] as const)("#given an autonomous turn #when the handle is stopped via %s #then its waiter is cancelled and late starts do not reopen it", async (stop) => {
+    const fake = createEmittingSession()
+    const handle = createRestoredChildHandle({ taskId: "task-1", session: fake.session })
+    let resumed = 0
+    handle.onSelfResumed?.(() => { resumed += 1 })
+    fake.emit({ type: "agent_start" })
+    const outcome = handle.waitForIdle()
+
+    await handle[stop]()
+    expect(await outcome).toEqual({ status: "cancelled" })
+    fake.emit({ type: "agent_start" })
+    fake.emit(assistantEnd("late result", "stop"))
+    fake.emit({ type: "agent_idle" })
+    expect(await handle.waitForIdle()).toEqual({ status: "cancelled" })
+    expect(resumed).toBe(1)
+    await handle.dispose()
   })
 
   test("#given a healthy turn with assistant text #when the prompt resolves #then the outcome completes with this turn's text", async () => {
